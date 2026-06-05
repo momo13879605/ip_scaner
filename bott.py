@@ -1,38 +1,34 @@
 #!/usr/bin/env python3
 """
-Telegram Bot - Advanced Multi-Port Network Scanner
-Professional Edition | Admin Panel | Interactive | High Compression ZIP Output
+Ultimate Telegram Bot - Advanced Multi-Port Network Scanner
+Professional Admin Panel | Rate Limiter | Export Tools | Inline Menus
+Version 2.0
 """
 
-import os
-import sys
-import asyncio
-import logging
-import tempfile
-import zipfile
-import socket
-import ipaddress
-import concurrent.futures
-import time
-import random
-import sqlite3
-from datetime import datetime, timedelta
-from typing import List, Dict, Set, Tuple, Optional
+import os, sys, asyncio, logging, tempfile, zipfile, socket, ipaddress
+import concurrent.futures, time, random, sqlite3, csv, io
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Set, Tuple, Optional, Any
 
 # Telegram Bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters
 )
 from telegram.constants import ParseMode
 
 # --------------------------------------------------------------------------------
-# Logging
+# ⚙️ تنظیمات اصلی - بدون نیاز به .env (فقط این‌جا تغییر دهید)
+# --------------------------------------------------------------------------------
+BOT_TOKEN = "8986138877:AAE-b5XiSWSeYnV95_gK2Uj6bDG0HghUKkE"                           # توکن ربات
+ADMIN_IDS = [8187239222, 5914346958]                       # آیدی عددی ادمین‌ها
+AUTH_REQUIRED = False                                      # اگر True فقط کاربران مجاز اسکن کنند
+DB_PATH = "scanner_bot.db"                                 # مسیر دیتابیس
+RATE_LIMIT_SECONDS = 0                                     # فاصله زمانی اجباری بین اسکن‌ها (0 = بدون محدودیت)
+
+# --------------------------------------------------------------------------------
+# راه‌اندازی لاگر
 # --------------------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,24 +37,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------
-# Environment & Configuration
+# لایه دیتابیس
 # --------------------------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-admin_ids_raw = os.getenv("ADMIN_IDS", "8187239222,5914346958")
-ADMIN_IDS = [int(x.strip()) for x in admin_ids_raw.split(",") if x.strip()]
-AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "False").lower() == "true"
-
-# --------------------------------------------------------------------------------
-# Database (SQLite via thread executor for async safety)
-# --------------------------------------------------------------------------------
-DB_PATH = "bot_scanner.db"
-
 class Database:
-    def __init__(self):
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -72,106 +59,118 @@ class Database:
             """)
             conn.commit()
 
-    async def get_user(self, user_id: int) -> Optional[Dict]:
+    async def _execute(self, query, *args, fetch=False):
         def _sync():
-            with sqlite3.connect(DB_PATH) as conn:
-                cursor = conn.execute(
-                    "SELECT * FROM users WHERE user_id = ?", (user_id,)
-                )
-                row = cursor.fetchone()
-                if row:
-                    return {
-                        "user_id": row[0],
-                        "username": row[1],
-                        "first_name": row[2],
-                        "is_authorized": bool(row[3]),
-                        "is_banned": bool(row[4]),
-                        "scan_count": row[5],
-                        "last_scan": row[6],
-                    }
-                return None
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(query, args)
+                if fetch:
+                    return [dict(row) for row in cur.fetchall()]
+                conn.commit()
         return await asyncio.to_thread(_sync)
+
+    async def get_user(self, user_id: int) -> Optional[Dict]:
+        rows = await self._execute("SELECT * FROM users WHERE user_id = ?", user_id, fetch=True)
+        return rows[0] if rows else None
 
     async def add_or_update_user(self, user_id: int, username: str, first_name: str) -> None:
-        def _sync():
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO users (user_id, username, first_name)
-                    VALUES (?, ?, ?)
-                """, (user_id, username, first_name))
-                conn.commit()
-        await asyncio.to_thread(_sync)
+        await self._execute(
+            "INSERT OR REPLACE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+            user_id, username, first_name
+        )
 
     async def increment_scan(self, user_id: int) -> None:
-        def _sync():
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("""
-                    UPDATE users SET scan_count = scan_count + 1,
-                    last_scan = ?
-                    WHERE user_id = ?
-                """, (datetime.now().isoformat(), user_id))
-                conn.commit()
-        await asyncio.to_thread(_sync)
+        await self._execute(
+            "UPDATE users SET scan_count = scan_count + 1, last_scan = ? WHERE user_id = ?",
+            datetime.now(timezone.utc).isoformat(), user_id
+        )
 
-    async def set_authorized(self, user_id: int, authorized: bool) -> None:
-        def _sync():
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    "UPDATE users SET is_authorized = ? WHERE user_id = ?",
-                    (int(authorized), user_id)
-                )
-                conn.commit()
-        await asyncio.to_thread(_sync)
+    async def set_authorized(self, user_id: int, status: bool) -> None:
+        await self._execute(
+            "UPDATE users SET is_authorized = ? WHERE user_id = ?",
+            int(status), user_id
+        )
 
-    async def set_banned(self, user_id: int, banned: bool) -> None:
-        def _sync():
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    "UPDATE users SET is_banned = ? WHERE user_id = ?",
-                    (int(banned), user_id)
-                )
-                conn.commit()
-        await asyncio.to_thread(_sync)
+    async def set_banned(self, user_id: int, status: bool) -> None:
+        await self._execute(
+            "UPDATE users SET is_banned = ? WHERE user_id = ?",
+            int(status), user_id
+        )
 
     async def get_all_users(self) -> List[Dict]:
-        def _sync():
-            with sqlite3.connect(DB_PATH) as conn:
-                cursor = conn.execute("SELECT * FROM users")
-                rows = cursor.fetchall()
-                return [
-                    {
-                        "user_id": row[0],
-                        "username": row[1],
-                        "first_name": row[2],
-                        "is_authorized": bool(row[3]),
-                        "is_banned": bool(row[4]),
-                        "scan_count": row[5],
-                        "last_scan": row[6],
-                    }
-                    for row in rows
-                ]
-        return await asyncio.to_thread(_sync)
+        return await self._execute("SELECT * FROM users", fetch=True)
 
-    async def get_stats(self) -> Dict:
-        def _sync():
-            with sqlite3.connect(DB_PATH) as conn:
-                total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-                active_today = conn.execute(
-                    "SELECT COUNT(*) FROM users WHERE last_scan > ?",
-                    (datetime.now().strftime("%Y-%m-%d"),)
-                ).fetchone()[0]
-                total_scans = conn.execute("SELECT SUM(scan_count) FROM users").fetchone()[0] or 0
-                return {
-                    "total_users": total_users,
-                    "active_today": active_today,
-                    "total_scans": total_scans,
-                }
-        return await asyncio.to_thread(_sync)
+    async def get_stats(self) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        month_ago = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+
+        total = await self._execute("SELECT COUNT(*) as c FROM users", fetch=True)
+        active_today = await self._execute("SELECT COUNT(*) as c FROM users WHERE last_scan > ?", today, fetch=True)
+        active_week = await self._execute("SELECT COUNT(*) as c FROM users WHERE last_scan > ?", week_ago, fetch=True)
+        active_month = await self._execute("SELECT COUNT(*) as c FROM users WHERE last_scan > ?", month_ago, fetch=True)
+        total_scans = await self._execute("SELECT SUM(scan_count) as c FROM users", fetch=True)
+        banned = await self._execute("SELECT COUNT(*) as c FROM users WHERE is_banned = 1", fetch=True)
+        authorized = await self._execute("SELECT COUNT(*) as c FROM users WHERE is_authorized = 1", fetch=True)
+
+        return {
+            "total_users": total[0]['c'],
+            "active_today": active_today[0]['c'],
+            "active_week": active_week[0]['c'],
+            "active_month": active_month[0]['c'],
+            "total_scans": total_scans[0]['c'] or 0,
+            "banned_users": banned[0]['c'],
+            "authorized_users": authorized[0]['c'],
+        }
+
+    async def reset_user_scans(self, user_id: int) -> None:
+        await self._execute(
+            "UPDATE users SET scan_count = 0, last_scan = NULL WHERE user_id = ?",
+            user_id
+        )
+
+    async def clear_all(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM users")
+            conn.commit()
+
+    async def auth_all(self, status: bool) -> None:
+        await self._execute("UPDATE users SET is_authorized = ?", int(status))
+
+    async def export_csv(self) -> str:
+        rows = await self.get_all_users()
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["user_id", "username", "first_name", "is_authorized", "is_banned", "scan_count", "last_scan"])
+        for r in rows:
+            writer.writerow([r["user_id"], r["username"], r["first_name"], r["is_authorized"], r["is_banned"], r["scan_count"], r["last_scan"]])
+        return output.getvalue()
 
 db = Database()
 
 # --------------------------------------------------------------------------------
-# IP Range Parsing Utilities (same as previous)
+# مدیریت محدودیت نرخ (Rate Limiter)
+# --------------------------------------------------------------------------------
+rate_limit_seconds = RATE_LIMIT_SECONDS
+last_scan_times: Dict[int, float] = {}
+
+def check_rate_limit(user_id: int) -> Tuple[bool, int]:
+    """بررسی محدودیت زمانی. (مجاز است یا خیر, ثانیه‌های باقی‌مانده)"""
+    if rate_limit_seconds <= 0 or user_id in ADMIN_IDS:
+        return True, 0
+    now = time.time()
+    last = last_scan_times.get(user_id, 0)
+    diff = now - last
+    if diff >= rate_limit_seconds:
+        return True, 0
+    return False, int(rate_limit_seconds - diff)
+
+def update_rate_limit(user_id: int):
+    last_scan_times[user_id] = time.time()
+
+# --------------------------------------------------------------------------------
+# ابزارهای آی‌پی و اسکن
 # --------------------------------------------------------------------------------
 def parse_ip_range(range_str: str) -> List[ipaddress.IPv4Address]:
     range_str = range_str.strip()
@@ -179,236 +178,232 @@ def parse_ip_range(range_str: str) -> List[ipaddress.IPv4Address]:
         return []
     if '/' in range_str:
         try:
-            network = ipaddress.ip_network(range_str, strict=False)
-            return list(network.hosts())
-        except ValueError:
+            return list(ipaddress.ip_network(range_str, strict=False).hosts())
+        except:
             return []
     if '-' in range_str:
         parts = range_str.split('-')
         if len(parts) != 2:
             return []
         try:
-            start = ipaddress.IPv4Address(parts[0].strip())
-            end = ipaddress.IPv4Address(parts[1].strip())
-        except ipaddress.AddressValueError:
+            s = ipaddress.IPv4Address(parts[0].strip())
+            e = ipaddress.IPv4Address(parts[1].strip())
+        except:
             return []
-        if start > end:
-            start, end = end, start
-        return [ipaddress.IPv4Address(i) for i in range(int(start), int(end)+1)]
+        if s > e:
+            s, e = e, s
+        return [ipaddress.IPv4Address(i) for i in range(int(s), int(e)+1)]
     try:
         return [ipaddress.IPv4Address(range_str)]
-    except ipaddress.AddressValueError:
+    except:
         return []
 
-def load_ranges_from_text(text: str) -> Set[ipaddress.IPv4Address]:
+def load_ranges(text: str) -> Set[ipaddress.IPv4Address]:
     ips = set()
     for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        ips.update(parse_ip_range(line))
+        if line and not line.startswith('#'):
+            ips.update(parse_ip_range(line))
     return ips
 
-# --------------------------------------------------------------------------------
-# Scanner (Sequential, Threaded, same core as before)
-# --------------------------------------------------------------------------------
 class SequentialPortScanner:
-    def __init__(self, target_ips: List[ipaddress.IPv4Address], ports: List[int],
-                 threads: int = 200, timeout: float = 0.8, shuffle: bool = False):
-        self.target_ips = target_ips
+    def __init__(self, ips: List[ipaddress.IPv4Address], ports: List[int],
+                 threads=200, timeout=0.8, shuffle=False):
+        self.ips = ips
         self.ports = ports
         self.threads = threads
         self.timeout = timeout
         self.shuffle = shuffle
-        self.all_open_pairs: List[str] = []
+        self.results: List[str] = []
 
     def scan_port(self, port: int) -> Set[str]:
-        open_ips = set()
-        total = len(self.target_ips)
-        scanned = 0
-        ips_to_scan = self.target_ips.copy()
+        open_set = set()
+        ips = self.ips.copy()
         if self.shuffle:
-            random.shuffle(ips_to_scan)
+            random.shuffle(ips)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            future_to_ip = {executor.submit(self._check_port, ip, port): ip for ip in ips_to_scan}
-            for future in concurrent.futures.as_completed(future_to_ip):
-                scanned += 1
-                ip, is_open = future.result()
-                if is_open:
-                    open_ips.add(str(ip))
-        return open_ips
+            fut = {executor.submit(self._check, ip, port): ip for ip in ips}
+            for future in concurrent.futures.as_completed(fut):
+                ip, ok = future.result()
+                if ok:
+                    open_set.add(str(ip))
+        return open_set
 
-    def _check_port(self, ip: ipaddress.IPv4Address, port: int) -> Tuple[ipaddress.IPv4Address, bool]:
+    def _check(self, ip: ipaddress.IPv4Address, port: int):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.timeout)
-                result = sock.connect_ex((str(ip), port))
-                return ip, (result == 0)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(self.timeout)
+                return ip, (s.connect_ex((str(ip), port)) == 0)
         except:
             return ip, False
 
     def run(self):
         for port in self.ports:
-            open_ips = self.scan_port(port)
-            for ip in sorted(open_ips):
-                self.all_open_pairs.append(f"{ip}:{port}")
-        self.all_open_pairs.sort()
+            for ip in sorted(self.scan_port(port)):
+                self.results.append(f"{ip}:{port}")
 
 # --------------------------------------------------------------------------------
-# Helper to create compressed ZIP
+# فشرده‌سازی در ZIP
 # --------------------------------------------------------------------------------
-def create_zip_from_text(text: str, filename: str = "scan_results.txt") -> str:
-    """Create a highly compressed ZIP file containing the text, return temp file path."""
-    tmp_dir = tempfile.mkdtemp()
-    zip_path = os.path.join(tmp_dir, "scan_results.zip")
-    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        zf.writestr(filename, text)
-    return zip_path
+def create_zip(text: str, fname="results.txt") -> str:
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "scan_results.zip")
+    with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.writestr(fname, text)
+    return path
 
 # --------------------------------------------------------------------------------
-# Bot Conversation States
+# دستیارهای inline
+# --------------------------------------------------------------------------------
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 آمار کلی", callback_data="admin_stats"),
+         InlineKeyboardButton("👤 اطلاعات کاربر", callback_data="admin_userinfo")],
+        [InlineKeyboardButton("📨 پیام همگانی", callback_data="admin_broadcast"),
+         InlineKeyboardButton("⏱ تنظیم نرخ", callback_data="admin_setrate")],
+        [InlineKeyboardButton("📂 خروجی CSV", callback_data="admin_exportcsv"),
+         InlineKeyboardButton("🗑 پاکسازی دیتابیس", callback_data="admin_cleardb")],
+        [InlineKeyboardButton("✅ مجاز کردن همه", callback_data="admin_authall"),
+         InlineKeyboardButton("❌ غیرمجاز کردن همه", callback_data="admin_deauthall")],
+    ])
+
+# --------------------------------------------------------------------------------
+# Stateهای مکالمه
 # --------------------------------------------------------------------------------
 TARGET, PORTS = range(2)
 
 # --------------------------------------------------------------------------------
-# Admin check decorator
+# Check user authorization and ban
 # --------------------------------------------------------------------------------
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("⛔ شما دسترسی ادمین ندارید.")
-            return
-        return await func(update, context)
-    return wrapper
-
-# --------------------------------------------------------------------------------
-# Command Handlers
-# --------------------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def authorize_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     await db.add_or_update_user(user.id, user.username, user.first_name)
-
-    # Check if banned
-    user_data = await db.get_user(user.id)
-    if user_data and user_data["is_banned"]:
+    data = await db.get_user(user.id)
+    if data and data["is_banned"]:
         await update.message.reply_text("⛔ شما از ربات مسدود شده‌اید.")
+        return False
+    if AUTH_REQUIRED and not (data and data["is_authorized"]):
+        await update.message.reply_text("⛔ شما مجاز به استفاده از ربات نیستید.")
+        return False
+    return True
+
+# --------------------------------------------------------------------------------
+# Command: /start
+# --------------------------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorize_user(update, context):
         return ConversationHandler.END
 
-    # Authorization check (if required)
-    if AUTH_REQUIRED and not (user_data and user_data["is_authorized"]):
-        await update.message.reply_text("⛔ شما مجاز به استفاده از ربات نیستید.")
+    # Rate limit check
+    ok, remaining = check_rate_limit(update.effective_user.id)
+    if not ok:
+        await update.message.reply_text(f"⏳ لطفاً {remaining} ثانیه دیگر صبر کنید.")
         return ConversationHandler.END
 
     await update.message.reply_text(
         "🔍 *اسکنر پیشرفته پورت*\n\n"
-        "📌 یک محدوده IP (مثل `192.168.1.1 - 192.168.100.100` یا `10.0.0.0/24`)\n"
-        "📎 یا یک فایل txt حاوی چندین محدوده را ارسال کنید.\n\n"
-        "برای لغو، /cancel را بفرستید.",
+        "📌 یک محدوده IP ارسال کنید:\n"
+        "مثال: `192.168.1.1 - 192.168.100.100`\n"
+        "یا `10.0.0.0/24`\n\n"
+        "📎 یا فایل txt شامل چندین محدوده.\n"
+        "برای لغو /cancel",
         parse_mode=ParseMode.MARKDOWN
     )
     return TARGET
 
+# --------------------------------------------------------------------------------
+# دریافت هدف
+# --------------------------------------------------------------------------------
 async def receive_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Handle text (IP range) or document (txt file)
     if update.message.document:
-        # It's a file
-        if not update.message.document.file_name.lower().endswith('.txt'):
-            await update.message.reply_text("❌ لطفاً فقط فایل txt ارسال کنید.")
+        doc = update.message.document
+        if not doc.file_name.lower().endswith('.txt'):
+            await update.message.reply_text("❌ فقط فایل txt پشتیبانی می‌شود.")
             return TARGET
         try:
-            file = await update.message.document.get_file()
-            # Save to temp file
+            file = await doc.get_file()
             with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
                 await file.download_to_drive(tmp.name)
                 with open(tmp.name, 'r', encoding='utf-8') as f:
                     content = f.read()
             os.unlink(tmp.name)
         except Exception as e:
-            await update.message.reply_text(f"❌ خطا در خواندن فایل: {e}")
+            await update.message.reply_text(f"❌ خطا: {e}")
             return TARGET
     elif update.message.text:
         content = update.message.text.strip()
     else:
-        await update.message.reply_text("❌ فقط متن یا فایل txt پشتیبانی می‌شود.")
         return TARGET
 
-    # Parse IPs
-    ip_set = load_ranges_from_text(content)
-    if not ip_set:
-        await update.message.reply_text("❌ هیچ IP معتبری در ورودی پیدا نشد. دوباره تلاش کنید.")
+    ips = load_ranges(content)
+    if not ips:
+        await update.message.reply_text("❌ هیچ IP معتبری یافت نشد.")
         return TARGET
 
-    # Store in context
-    context.user_data['target_ips'] = list(ip_set)
+    context.user_data['target_ips'] = list(ips)
     await update.message.reply_text(
-        f"✅ {len(ip_set)} IP معتبر دریافت شد.\n\n"
-        "⚙️ حالا پورت‌های مورد نظر را با کاما جدا کنید (مثال: `21,443`)",
+        f"✅ {len(ips)} IP دریافت شد.\n\n"
+        "⚙️ حالا پورت‌ها را وارد کنید (مثال: `21,443`)\n"
+        "/cancel برای لغو",
         parse_mode=ParseMode.MARKDOWN
     )
     return PORTS
 
+# --------------------------------------------------------------------------------
+# دریافت پورت‌ها و اجرای اسکن
+# --------------------------------------------------------------------------------
 async def receive_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.text:
         await update.message.reply_text("❌ متن وارد کنید.")
         return PORTS
 
     ports_str = update.message.text.strip()
-    ports = []
     try:
-        for part in ports_str.split(','):
-            p = int(part.strip())
-            if 1 <= p <= 65535:
-                ports.append(p)
-            else:
-                raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ پورت‌های نامعتبر. فقط اعداد 1-65535 با کاما.")
+        ports = [int(p.strip()) for p in ports_str.split(',') if 1 <= int(p.strip()) <= 65535]
+    except:
+        await update.message.reply_text("❌ پورت نامعتبر.")
         return PORTS
-
     if not ports:
-        await update.message.reply_text("❌ حداقل یک پورت وارد کنید.")
+        await update.message.reply_text("❌ حداقل یک پورت معتبر وارد کنید.")
         return PORTS
 
-    # Store ports
     context.user_data['ports'] = ports
 
-    # Start scan
+    # Rate limit update
+    update_rate_limit(update.effective_user.id)
+
     await update.message.reply_text(
-        f"🚀 اسکن آغاز شد... ({len(context.user_data['target_ips'])} IP برای پورت‌های {ports})\n"
-        "⏳ ممکن است کمی طول بکشد. لطفاً منتظر بمانید."
+        f"🚀 اسکن {len(context.user_data['target_ips'])} IP روی پورت‌های {ports} آغاز شد...\n"
+        "⏳ لطفاً منتظر بمانید."
     )
 
-    # Run scanner in thread
-    scanner = SequentialPortScanner(
-        target_ips=context.user_data['target_ips'],
-        ports=ports,
-        threads=200,
-        timeout=0.8
-    )
+    scanner = SequentialPortScanner(context.user_data['target_ips'], ports)
     try:
         await asyncio.to_thread(scanner.run)
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در اسکن: {e}")
         return ConversationHandler.END
 
-    # Update scan count
+    # بروزرسانی آمار
     await db.increment_scan(update.effective_user.id)
 
-    # Generate output
-    output_text = "\n".join(scanner.all_open_pairs) if scanner.all_open_pairs else "No open ports found."
+    if not scanner.results:
+        await update.message.reply_text("❌ هیچ پورت بازی پیدا نشد.")
+        return ConversationHandler.END
 
-    # Decide delivery method
-    if len(output_text) <= 4096:
-        await update.message.reply_text(f"✅ اسکن کامل شد.\n\n{output_text}")
+    output = "\n".join(scanner.results)
+
+    # ارسال هوشمند
+    if len(output) <= 4096:
+        await update.message.reply_text(f"✅ اسکن کامل شد:\n\n{output}")
     else:
-        # Create compressed zip
-        zip_path = create_zip_from_text(output_text)
-        await update.message.reply_document(
-            document=open(zip_path, 'rb'),
-            filename="scan_results.zip",
-            caption=f"📦 نتایج اسکن ({len(scanner.all_open_pairs)} باز)"
-        )
+        zip_path = create_zip(output)
+        with open(zip_path, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename="scan_results.zip",
+                caption=f"📦 نتایج ({len(scanner.results)} آیتم)"
+            )
         os.unlink(zip_path)
 
     return ConversationHandler.END
@@ -418,104 +413,196 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # --------------------------------------------------------------------------------
-# Admin Commands
+# پنل مدیریت
 # --------------------------------------------------------------------------------
-@admin_only
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = await db.get_stats()
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ دسترسی محدود.")
+        return
+    await update.message.reply_text(
+        "⚙️ *پنل مدیریت پیشرفته*\nیک گزینه را انتخاب کنید:",
+        reply_markup=admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# --------------------------------------------------------------------------------
+# Callback handler مدیریت
+# --------------------------------------------------------------------------------
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id not in ADMIN_IDS:
+        await query.edit_message_text("⛔ دسترسی غیرمجاز.")
+        return
+
+    data = query.data
+
+    if data == "admin_stats":
+        stats = await db.get_stats()
+        text = (
+            "📊 *آمار کلی*\n\n"
+            f"👥 کل کاربران: {stats['total_users']}\n"
+            f"📅 فعال امروز: {stats['active_today']}\n"
+            f"📆 فعال این هفته: {stats['active_week']}\n"
+            f"📆 فعال این ماه: {stats['active_month']}\n"
+            f"🔢 کل اسکن‌ها: {stats['total_scans']}\n"
+            f"🚫 کاربران مسدود: {stats['banned_users']}\n"
+            f"✅ کاربران مجاز: {stats['authorized_users']}\n"
+            f"⏱ محدودیت نرخ: {rate_limit_seconds} ثانیه"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_keyboard())
+
+    elif data == "admin_userinfo":
+        await query.edit_message_text(
+            "👤 لطفاً آیدی عددی کاربر را با دستور `/userinfo <id>` وارد کنید.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif data == "admin_broadcast":
+        await query.edit_message_text(
+            "📨 برای ارسال پیام همگانی از دستور `/broadcast <پیام>` استفاده کنید.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif data == "admin_setrate":
+        await query.edit_message_text(
+            "⏱ برای تنظیم محدودیت نرخ از `/setrate <ثانیه>` استفاده کنید.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif data == "admin_exportcsv":
+        csv_data = await db.export_csv()
+        buf = io.BytesIO(csv_data.encode('utf-8'))
+        buf.name = "users.csv"
+        await context.bot.send_document(chat_id=query.message.chat_id, document=buf)
+        await query.edit_message_text("📂 فایل CSV ارسال شد.", reply_markup=admin_keyboard())
+
+    elif data == "admin_cleardb":
+        await query.edit_message_text(
+            "⚠️ *اخطار:* با `/cleardb confirm` کل دیتابیس پاک می‌شود.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif data == "admin_authall":
+        await db.auth_all(True)
+        await query.edit_message_text("✅ همه کاربران مجاز شدند.", reply_markup=admin_keyboard())
+
+    elif data == "admin_deauthall":
+        await db.auth_all(False)
+        await query.edit_message_text("❌ همه کاربران غیرمجاز شدند.", reply_markup=admin_keyboard())
+
+# --------------------------------------------------------------------------------
+# دستورات متنی مدیریت
+# --------------------------------------------------------------------------------
+async def userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args:
+        await update.message.reply_text("استفاده: /userinfo <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except:
+        await update.message.reply_text("user_id نامعتبر.")
+        return
+    user = await db.get_user(uid)
+    if not user:
+        await update.message.reply_text("❌ کاربر یافت نشد.")
+        return
     text = (
-        "📊 *پنل مدیریت*\n\n"
-        f"👥 کاربران کل: {stats['total_users']}\n"
-        f"📅 کاربران فعال امروز: {stats['active_today']}\n"
-        f"🔢 تعداد کل اسکن‌ها: {stats['total_scans']}\n\n"
-        "دستورات:\n"
-        "/broadcast <پیام> - ارسال به همه\n"
-        "/adduser <user_id>\n"
-        "/removeuser <user_id>\n"
-        "/ban <user_id>\n"
-        "/unban <user_id>"
+        f"👤 *اطلاعات کاربر*\n\n"
+        f"🆔 آیدی: `{user['user_id']}`\n"
+        f"📛 نام: {user['first_name']}\n"
+        f"🏷 یوزرنیم: @{user['username']}\n"
+        f"🔢 تعداد اسکن: {user['scan_count']}\n"
+        f"📅 آخرین اسکن: {user['last_scan'] or 'ندارد'}\n"
+        f"✅ مجاز: {'بله' if user['is_authorized'] else 'خیر'}\n"
+        f"🚫 مسدود: {'بله' if user['is_banned'] else 'خیر'}"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-@admin_only
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ لطفاً پیام را وارد کنید. مثال: `/broadcast سلام`")
+    if update.effective_user.id not in ADMIN_IDS:
         return
-    message = ' '.join(context.args)
+    if not context.args:
+        await update.message.reply_text("استفاده: /broadcast <پیام>")
+        return
+    msg = ' '.join(context.args)
     users = await db.get_all_users()
-    success = 0
-    for user in users:
+    ok = 0
+    for u in users:
         try:
-            await context.bot.send_message(chat_id=user['user_id'], text=message)
-            success += 1
+            await context.bot.send_message(chat_id=u['user_id'], text=msg)
+            ok += 1
         except:
             pass
-    await update.message.reply_text(f"✅ پیام به {success}/{len(users)} کاربر ارسال شد.")
+    await update.message.reply_text(f"✅ پیام به {ok}/{len(users)} کاربر ارسال شد.")
 
-@admin_only
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ استفاده: /adduser <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-    except:
-        await update.message.reply_text("❌ user_id نامعتبر.")
-        return
+async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args: await update.message.reply_text("/adduser <id>"); return
+    try: uid = int(context.args[0])
+    except: await update.message.reply_text("id نامعتبر"); return
     await db.set_authorized(uid, True)
     await update.message.reply_text(f"✅ کاربر {uid} مجاز شد.")
 
-@admin_only
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ استفاده: /removeuser <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-    except:
-        await update.message.reply_text("❌ user_id نامعتبر.")
-        return
+async def removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args: await update.message.reply_text("/removeuser <id>"); return
+    try: uid = int(context.args[0])
+    except: await update.message.reply_text("id نامعتبر"); return
     await db.set_authorized(uid, False)
-    await update.message.reply_text(f"✅ کاربر {uid} غیرمجاز شد.")
+    await update.message.reply_text(f"❌ کاربر {uid} غیرمجاز شد.")
 
-@admin_only
-async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ استفاده: /ban <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-    except:
-        await update.message.reply_text("❌ user_id نامعتبر.")
-        return
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args: await update.message.reply_text("/ban <id>"); return
+    try: uid = int(context.args[0])
+    except: await update.message.reply_text("id نامعتبر"); return
     await db.set_banned(uid, True)
     await update.message.reply_text(f"🚫 کاربر {uid} مسدود شد.")
 
-@admin_only
-async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ استفاده: /unban <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-    except:
-        await update.message.reply_text("❌ user_id نامعتبر.")
-        return
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args: await update.message.reply_text("/unban <id>"); return
+    try: uid = int(context.args[0])
+    except: await update.message.reply_text("id نامعتبر"); return
     await db.set_banned(uid, False)
     await update.message.reply_text(f"✅ کاربر {uid} رفع مسدودیت شد.")
 
+async def setrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args: await update.message.reply_text("/setrate <ثانیه>"); return
+    try: sec = int(context.args[0])
+    except: await update.message.reply_text("عدد وارد کنید"); return
+    global rate_limit_seconds
+    rate_limit_seconds = max(0, sec)
+    await update.message.reply_text(f"⏱ محدودیت نرخ روی {rate_limit_seconds} ثانیه تنظیم شد.")
+
+async def resetuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args: await update.message.reply_text("/resetuser <id>"); return
+    try: uid = int(context.args[0])
+    except: await update.message.reply_text("id نامعتبر"); return
+    await db.reset_user_scans(uid)
+    await update.message.reply_text(f"🔄 شمارنده کاربر {uid} صفر شد.")
+
+async def cleardb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_text("⚠️ برای پاکسازی کامل، `/cleardb confirm` را بفرستید.")
+        return
+    await db.clear_all()
+    last_scan_times.clear()
+    await update.message.reply_text("🗑 تمام داده‌ها حذف شدند.")
+
 # --------------------------------------------------------------------------------
-# Main Application
+# اجرای اصلی
 # --------------------------------------------------------------------------------
 def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is missing!")
-        sys.exit(1)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation handler for scan flow
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -529,16 +616,19 @@ def main():
     )
 
     app.add_handler(conv_handler)
-
-    # Admin commands
-    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
+    app.add_handler(CommandHandler("userinfo", userinfo))
     app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("adduser", add_user))
-    app.add_handler(CommandHandler("removeuser", remove_user))
-    app.add_handler(CommandHandler("ban", ban_user))
-    app.add_handler(CommandHandler("unban", unban_user))
+    app.add_handler(CommandHandler("adduser", adduser))
+    app.add_handler(CommandHandler("removeuser", removeuser))
+    app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("unban", unban))
+    app.add_handler(CommandHandler("setrate", setrate))
+    app.add_handler(CommandHandler("resetuser", resetuser))
+    app.add_handler(CommandHandler("cleardb", cleardb))
 
-    logger.info("Bot started...")
+    print("✅ ربات آماده سرویس‌دهی است...")
     app.run_polling()
 
 if __name__ == "__main__":
