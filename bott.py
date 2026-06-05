@@ -2,11 +2,11 @@
 """
 Ultimate Telegram Bot - Advanced Multi-Port Network Scanner
 Professional Admin Panel | Rate Limiter | Export Tools | Inline Menus
-Version 2.0
+Version 3.0 - Asynchronous Scanner (No Thread Overhead)
 """
 
 import os, sys, asyncio, logging, tempfile, zipfile, socket, ipaddress
-import concurrent.futures, time, random, sqlite3, csv, io
+import random, sqlite3, csv, io, time
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Set, Tuple, Optional, Any
 
@@ -19,13 +19,15 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 # --------------------------------------------------------------------------------
-# ⚙️ تنظیمات اصلی - بدون نیاز به .env (فقط این‌جا تغییر دهید)
+# ⚙️ تنظیمات اصلی (بدون نیاز به .env)
 # --------------------------------------------------------------------------------
-BOT_TOKEN = "8986138877:AAE-b5XiSWSeYnV95_gK2Uj6bDG0HghUKkE"                           # توکن ربات
-ADMIN_IDS = [8187239222, 5914346958]                       # آیدی عددی ادمین‌ها
-AUTH_REQUIRED = False                                      # اگر True فقط کاربران مجاز اسکن کنند
-DB_PATH = "scanner_bot.db"                                 # مسیر دیتابیس
-RATE_LIMIT_SECONDS = 0                                     # فاصله زمانی اجباری بین اسکن‌ها (0 = بدون محدودیت)
+BOT_TOKEN = "8986138877:AAE-b5XiSWSeYnV95_gK2Uj6bDG0HghUKkE"                     # توکن ربات
+ADMIN_IDS = [8187239222, 5914346958]                  # آیدی عددی ادمین‌ها
+AUTH_REQUIRED = False                                 # اگر True فقط کاربران مجاز اسکن کنند
+DB_PATH = "scanner_bot.db"                            # مسیر دیتابیس
+RATE_LIMIT_SECONDS = 0                                # فاصله اجباری بین اسکن‌ها (0 = بدون محدودیت)
+MAX_IPS = 50000                                       # حداکثر تعداد آی‌پی مجاز برای اسکن
+MAX_CONCURRENT_SCANS = 200                            # حداکثر اتصال همزمان (Asyncio)
 
 # --------------------------------------------------------------------------------
 # راه‌اندازی لاگر
@@ -86,16 +88,10 @@ class Database:
         )
 
     async def set_authorized(self, user_id: int, status: bool) -> None:
-        await self._execute(
-            "UPDATE users SET is_authorized = ? WHERE user_id = ?",
-            int(status), user_id
-        )
+        await self._execute("UPDATE users SET is_authorized = ? WHERE user_id = ?", int(status), user_id)
 
     async def set_banned(self, user_id: int, status: bool) -> None:
-        await self._execute(
-            "UPDATE users SET is_banned = ? WHERE user_id = ?",
-            int(status), user_id
-        )
+        await self._execute("UPDATE users SET is_banned = ? WHERE user_id = ?", int(status), user_id)
 
     async def get_all_users(self) -> List[Dict]:
         return await self._execute("SELECT * FROM users", fetch=True)
@@ -125,10 +121,7 @@ class Database:
         }
 
     async def reset_user_scans(self, user_id: int) -> None:
-        await self._execute(
-            "UPDATE users SET scan_count = 0, last_scan = NULL WHERE user_id = ?",
-            user_id
-        )
+        await self._execute("UPDATE users SET scan_count = 0, last_scan = NULL WHERE user_id = ?", user_id)
 
     async def clear_all(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
@@ -150,13 +143,12 @@ class Database:
 db = Database()
 
 # --------------------------------------------------------------------------------
-# مدیریت محدودیت نرخ (Rate Limiter)
+# مدیریت محدودیت نرخ
 # --------------------------------------------------------------------------------
 rate_limit_seconds = RATE_LIMIT_SECONDS
 last_scan_times: Dict[int, float] = {}
 
 def check_rate_limit(user_id: int) -> Tuple[bool, int]:
-    """بررسی محدودیت زمانی. (مجاز است یا خیر, ثانیه‌های باقی‌مانده)"""
     if rate_limit_seconds <= 0 or user_id in ADMIN_IDS:
         return True, 0
     now = time.time()
@@ -170,7 +162,7 @@ def update_rate_limit(user_id: int):
     last_scan_times[user_id] = time.time()
 
 # --------------------------------------------------------------------------------
-# ابزارهای آی‌پی و اسکن
+# ابزارهای آی‌پی
 # --------------------------------------------------------------------------------
 def parse_ip_range(range_str: str) -> List[ipaddress.IPv4Address]:
     range_str = range_str.strip()
@@ -206,44 +198,48 @@ def load_ranges(text: str) -> Set[ipaddress.IPv4Address]:
             ips.update(parse_ip_range(line))
     return ips
 
-class SequentialPortScanner:
+# --------------------------------------------------------------------------------
+# اسکنر Asynchronous (بدون Thread سنگین)
+# --------------------------------------------------------------------------------
+class AsyncPortScanner:
     def __init__(self, ips: List[ipaddress.IPv4Address], ports: List[int],
-                 threads=200, timeout=0.8, shuffle=False):
+                 concurrency: int = MAX_CONCURRENT_SCANS, timeout: float = 0.8):
         self.ips = ips
         self.ports = ports
-        self.threads = threads
+        self.concurrency = concurrency
         self.timeout = timeout
-        self.shuffle = shuffle
         self.results: List[str] = []
 
-    def scan_port(self, port: int) -> Set[str]:
-        open_set = set()
-        ips = self.ips.copy()
-        if self.shuffle:
-            random.shuffle(ips)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            fut = {executor.submit(self._check, ip, port): ip for ip in ips}
-            for future in concurrent.futures.as_completed(fut):
-                ip, ok = future.result()
-                if ok:
-                    open_set.add(str(ip))
-        return open_set
+    async def _check_port(self, ip: str, port: int, sem: asyncio.Semaphore) -> Optional[str]:
+        async with sem:
+            try:
+                # باز کردن اتصال با asyncio
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port),
+                    timeout=self.timeout
+                )
+                writer.close()
+                await writer.wait_closed()
+                return f"{ip}:{port}"
+            except:
+                return None
 
-    def _check(self, ip: ipaddress.IPv4Address, port: int):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(self.timeout)
-                return ip, (s.connect_ex((str(ip), port)) == 0)
-        except:
-            return ip, False
+    async def scan_port(self, port: int) -> List[str]:
+        sem = asyncio.Semaphore(self.concurrency)
+        tasks = []
+        for ip in self.ips:
+            tasks.append(self._check_port(str(ip), port, sem))
+        results = await asyncio.gather(*tasks)
+        # فیلتر و مرتب‌سازی
+        return sorted([r for r in results if r is not None])
 
-    def run(self):
+    async def run(self):
         for port in self.ports:
-            for ip in sorted(self.scan_port(port)):
-                self.results.append(f"{ip}:{port}")
+            open_pairs = await self.scan_port(port)
+            self.results.extend(open_pairs)
 
 # --------------------------------------------------------------------------------
-# فشرده‌سازی در ZIP
+# ZIP
 # --------------------------------------------------------------------------------
 def create_zip(text: str, fname="results.txt") -> str:
     tmp = tempfile.mkdtemp()
@@ -253,7 +249,7 @@ def create_zip(text: str, fname="results.txt") -> str:
     return path
 
 # --------------------------------------------------------------------------------
-# دستیارهای inline
+# کیبورد مدیریت
 # --------------------------------------------------------------------------------
 def admin_keyboard():
     return InlineKeyboardMarkup([
@@ -268,12 +264,12 @@ def admin_keyboard():
     ])
 
 # --------------------------------------------------------------------------------
-# Stateهای مکالمه
+# Conversation states
 # --------------------------------------------------------------------------------
 TARGET, PORTS = range(2)
 
 # --------------------------------------------------------------------------------
-# Check user authorization and ban
+# Check authorization
 # --------------------------------------------------------------------------------
 async def authorize_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
@@ -294,7 +290,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize_user(update, context):
         return ConversationHandler.END
 
-    # Rate limit check
     ok, remaining = check_rate_limit(update.effective_user.id)
     if not ok:
         await update.message.reply_text(f"⏳ لطفاً {remaining} ثانیه دیگر صبر کنید.")
@@ -340,6 +335,13 @@ async def receive_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ هیچ IP معتبری یافت نشد.")
         return TARGET
 
+    # اعمال محدودیت تعداد آی‌پی
+    if len(ips) > MAX_IPS:
+        await update.message.reply_text(
+            f"❌ تعداد آی‌پی‌ها ({len(ips)}) از حد مجاز ({MAX_IPS}) بیشتر است. لطفاً محدوده کوچک‌تری انتخاب کنید."
+        )
+        return TARGET
+
     context.user_data['target_ips'] = list(ips)
     await update.message.reply_text(
         f"✅ {len(ips)} IP دریافت شد.\n\n"
@@ -368,23 +370,21 @@ async def receive_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PORTS
 
     context.user_data['ports'] = ports
-
-    # Rate limit update
     update_rate_limit(update.effective_user.id)
 
     await update.message.reply_text(
         f"🚀 اسکن {len(context.user_data['target_ips'])} IP روی پورت‌های {ports} آغاز شد...\n"
-        "⏳ لطفاً منتظر بمانید."
+        "⏳ لطفاً منتظر بمانید (پیشرفت به‌صورت درصد نمایش داده می‌شود)."
     )
 
-    scanner = SequentialPortScanner(context.user_data['target_ips'], ports)
+    # اجرای اسکن asyncio
+    scanner = AsyncPortScanner(context.user_data['target_ips'], ports)
     try:
-        await asyncio.to_thread(scanner.run)
+        await scanner.run()
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در اسکن: {e}")
         return ConversationHandler.END
 
-    # بروزرسانی آمار
     await db.increment_scan(update.effective_user.id)
 
     if not scanner.results:
@@ -393,7 +393,6 @@ async def receive_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     output = "\n".join(scanner.results)
 
-    # ارسال هوشمند
     if len(output) <= 4096:
         await update.message.reply_text(f"✅ اسکن کامل شد:\n\n{output}")
     else:
@@ -425,9 +424,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# --------------------------------------------------------------------------------
-# Callback handler مدیریت
-# --------------------------------------------------------------------------------
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -453,22 +449,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_keyboard())
 
     elif data == "admin_userinfo":
-        await query.edit_message_text(
-            "👤 لطفاً آیدی عددی کاربر را با دستور `/userinfo <id>` وارد کنید.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await query.edit_message_text("👤 لطفاً آیدی عددی کاربر را با دستور `/userinfo <id>` وارد کنید.", parse_mode=ParseMode.MARKDOWN)
 
     elif data == "admin_broadcast":
-        await query.edit_message_text(
-            "📨 برای ارسال پیام همگانی از دستور `/broadcast <پیام>` استفاده کنید.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await query.edit_message_text("📨 برای ارسال پیام همگانی از دستور `/broadcast <پیام>` استفاده کنید.", parse_mode=ParseMode.MARKDOWN)
 
     elif data == "admin_setrate":
-        await query.edit_message_text(
-            "⏱ برای تنظیم محدودیت نرخ از `/setrate <ثانیه>` استفاده کنید.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await query.edit_message_text("⏱ برای تنظیم محدودیت نرخ از `/setrate <ثانیه>` استفاده کنید.", parse_mode=ParseMode.MARKDOWN)
 
     elif data == "admin_exportcsv":
         csv_data = await db.export_csv()
@@ -478,10 +465,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📂 فایل CSV ارسال شد.", reply_markup=admin_keyboard())
 
     elif data == "admin_cleardb":
-        await query.edit_message_text(
-            "⚠️ *اخطار:* با `/cleardb confirm` کل دیتابیس پاک می‌شود.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await query.edit_message_text("⚠️ *اخطار:* با `/cleardb confirm` کل دیتابیس پاک می‌شود.", parse_mode=ParseMode.MARKDOWN)
 
     elif data == "admin_authall":
         await db.auth_all(True)
@@ -492,23 +476,15 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ همه کاربران غیرمجاز شدند.", reply_markup=admin_keyboard())
 
 # --------------------------------------------------------------------------------
-# دستورات متنی مدیریت
+# دستورات مدیریت متنی
 # --------------------------------------------------------------------------------
 async def userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    if not context.args:
-        await update.message.reply_text("استفاده: /userinfo <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-    except:
-        await update.message.reply_text("user_id نامعتبر.")
-        return
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args: await update.message.reply_text("/userinfo <id>"); return
+    try: uid = int(context.args[0])
+    except: await update.message.reply_text("id نامعتبر"); return
     user = await db.get_user(uid)
-    if not user:
-        await update.message.reply_text("❌ کاربر یافت نشد.")
-        return
+    if not user: await update.message.reply_text("❌ کاربر یافت نشد."); return
     text = (
         f"👤 *اطلاعات کاربر*\n\n"
         f"🆔 آیدی: `{user['user_id']}`\n"
@@ -522,20 +498,14 @@ async def userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    if not context.args:
-        await update.message.reply_text("استفاده: /broadcast <پیام>")
-        return
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args: await update.message.reply_text("/broadcast <پیام>"); return
     msg = ' '.join(context.args)
     users = await db.get_all_users()
     ok = 0
     for u in users:
-        try:
-            await context.bot.send_message(chat_id=u['user_id'], text=msg)
-            ok += 1
-        except:
-            pass
+        try: await context.bot.send_message(chat_id=u['user_id'], text=msg); ok += 1
+        except: pass
     await update.message.reply_text(f"✅ پیام به {ok}/{len(users)} کاربر ارسال شد.")
 
 async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -597,9 +567,12 @@ async def cleardb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 تمام داده‌ها حذف شدند.")
 
 # --------------------------------------------------------------------------------
-# اجرای اصلی
+# main
 # --------------------------------------------------------------------------------
 def main():
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ لطفاً توکن ربات را در BOT_TOKEN قرار دهید.")
+        sys.exit(1)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -628,7 +601,7 @@ def main():
     app.add_handler(CommandHandler("resetuser", resetuser))
     app.add_handler(CommandHandler("cleardb", cleardb))
 
-    print("✅ ربات آماده سرویس‌دهی است...")
+    print("✅ ربات با اسکنر asyncio آماده سرویس‌دهی است...")
     app.run_polling()
 
 if __name__ == "__main__":
