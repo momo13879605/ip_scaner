@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------------
 # Environment & Configuration
 # --------------------------------------------------------------------------------
-BOT_TOKEN = os.getenv("8986138877:AAE-b5XiSWSeYnV95_gK2Uj6bDG0HghUKkE")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 admin_ids_raw = os.getenv("ADMIN_IDS", "8187239222,5914346958")
 ADMIN_IDS = [int(x.strip()) for x in admin_ids_raw.split(",") if x.strip()]
 AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "False").lower() == "true"
